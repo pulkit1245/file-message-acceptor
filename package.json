@@ -11,6 +11,8 @@
   "license": "ISC",
   "description": "A simple message and file receiver with a dashboard",
   "dependencies": {
+    "@supabase/supabase-js": "^2.106.2",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "multer": "^2.1.1",
     "uuid": "^14.0.0"

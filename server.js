@@ -1,46 +1,31 @@
+require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Storage Setup ────────────────────────────────────────────────────────────
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const DATA_FILE = path.join(__dirname, 'data.json');
+// ─── Supabase Setup ───────────────────────────────────────────────────────────
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
 
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ messages: [], files: [] }));
+if (!supabaseUrl || !supabaseKey) {
+  console.error("Missing SUPABASE_URL or SUPABASE_KEY in environment variables.");
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // ─── Multer Config ────────────────────────────────────────────────────────────
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const uniqueName = `${uuidv4()}-${file.originalname}`;
-    cb(null, uniqueName);
-  },
-});
-
+// Use memory storage since we're uploading directly to Supabase
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function readData() {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
-    return { messages: [], files: [] };
-  }
-}
-
-function writeData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
   const k = 1024;
@@ -60,13 +45,32 @@ function formatDate(iso) {
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // GET / — Dashboard
-app.get('/', (req, res) => {
-  const data = readData();
-  res.send(renderDashboard(data));
+app.get('/', async (req, res) => {
+  try {
+    const { data: messages } = await supabase
+      .from('messages')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    const { data: files } = await supabase
+      .from('files')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    const data = {
+      messages: messages || [],
+      files: files || []
+    };
+
+    res.send(renderDashboard(data));
+  } catch (error) {
+    console.error("Error fetching data:", error);
+    res.status(500).send("Error loading dashboard.");
+  }
 });
 
 // GET /message/:text — Accept a message via URL path
-app.get('/message/:text', (req, res) => {
+app.get('/message/:text', async (req, res) => {
   const text = decodeURIComponent(req.params.text);
   if (!text || !text.trim()) {
     return res.status(400).json({
@@ -75,20 +79,25 @@ app.get('/message/:text', (req, res) => {
     });
   }
 
-  const data = readData();
   const entry = {
-    id: uuidv4(),
     text: text.trim(),
     ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown',
-    timestamp: new Date().toISOString(),
   };
-  data.messages.unshift(entry);
-  writeData(data);
+
+  const { data, error } = await supabase
+    .from('messages')
+    .insert([entry])
+    .select();
+
+  if (error) {
+    console.error("Error inserting message:", error);
+    return res.status(500).json({ success: false, error: 'Database error' });
+  }
 
   res.json({
     success: true,
     message: 'Message received!',
-    data: entry,
+    data: data[0],
   });
 });
 
@@ -98,53 +107,67 @@ app.get('/upload', (req, res) => {
 });
 
 // POST /upload — Handle file upload
-app.post('/upload', upload.single('file'), (req, res) => {
+app.post('/upload', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'No file uploaded. Please attach a file.' });
   }
 
-  const data = readData();
-  const entry = {
-    id: uuidv4(),
-    originalName: req.file.originalname,
-    storedName: req.file.filename,
-    size: req.file.size,
-    mimetype: req.file.mimetype,
-    note: req.body.note ? req.body.note.trim() : '',
-    ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown',
-    timestamp: new Date().toISOString(),
-  };
-  data.files.unshift(entry);
-  writeData(data);
+  try {
+    const uniqueName = `${uuidv4()}-${req.file.originalname}`;
+    
+    // Upload to Supabase Storage
+    const { data: uploadData, error: uploadError } = await supabase
+      .storage
+      .from('uploads')
+      .upload(uniqueName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false
+      });
 
-  res.json({
-    success: true,
-    message: 'File uploaded successfully!',
-    data: {
-      ...entry,
-      downloadUrl: `/download/${entry.storedName}`,
-    },
-  });
-});
+    if (uploadError) throw uploadError;
 
-// GET /download/:filename — Serve a file for download
-app.get('/download/:filename', (req, res) => {
-  const filePath = path.join(UPLOADS_DIR, req.params.filename);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ success: false, error: 'File not found.' });
+    // Get public URL
+    const { data: urlData } = supabase
+      .storage
+      .from('uploads')
+      .getPublicUrl(uniqueName);
+
+    const downloadUrl = urlData.publicUrl;
+
+    // Save to Database
+    const entry = {
+      original_name: req.file.originalname,
+      stored_name: uniqueName,
+      size: req.file.size,
+      mimetype: req.file.mimetype,
+      note: req.body.note ? req.body.note.trim() : '',
+      ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown',
+      download_url: downloadUrl
+    };
+
+    const { data: dbData, error: dbError } = await supabase
+      .from('files')
+      .insert([entry])
+      .select();
+
+    if (dbError) throw dbError;
+
+    res.json({
+      success: true,
+      message: 'File uploaded successfully!',
+      data: dbData[0],
+    });
+  } catch (error) {
+    console.error("Upload error:", error);
+    res.status(500).json({ success: false, error: 'Failed to process upload.' });
   }
-
-  // Find original name
-  const data = readData();
-  const entry = data.files.find((f) => f.storedName === req.params.filename);
-  const downloadName = entry ? entry.originalName : req.params.filename;
-
-  res.download(filePath, downloadName);
 });
 
 // GET /api/data — Raw JSON data
-app.get('/api/data', (req, res) => {
-  res.json(readData());
+app.get('/api/data', async (req, res) => {
+  const { data: messages } = await supabase.from('messages').select('*').order('created_at', { ascending: false });
+  const { data: files } = await supabase.from('files').select('*').order('created_at', { ascending: false });
+  res.json({ messages: messages || [], files: files || [] });
 });
 
 // ─── HTML Templates ──────────────────────────────────────────────────────────
@@ -156,7 +179,7 @@ function renderDashboard(data) {
       <div class="card message-card">
         <div class="card-header">
           <span class="badge badge-msg">📨 Message</span>
-          <span class="time">${formatDate(m.timestamp)}</span>
+          <span class="time">${formatDate(m.created_at)}</span>
         </div>
         <p class="message-text">${escapeHtml(m.text)}</p>
         <div class="card-footer">
@@ -171,16 +194,16 @@ function renderDashboard(data) {
       <div class="card file-card">
         <div class="card-header">
           <span class="badge badge-file">📎 File</span>
-          <span class="time">${formatDate(f.timestamp)}</span>
+          <span class="time">${formatDate(f.created_at)}</span>
         </div>
         <div class="file-info">
-          <span class="file-name">📄 ${escapeHtml(f.originalName)}</span>
+          <span class="file-name">📄 ${escapeHtml(f.original_name)}</span>
           <span class="file-meta">${escapeHtml(f.mimetype)} · ${formatBytes(f.size)}</span>
         </div>
         ${f.note ? `<p class="file-note">💬 ${escapeHtml(f.note)}</p>` : ''}
         <div class="card-footer">
           <span class="meta">🌐 ${escapeHtml(f.ip)}</span>
-          <a href="/download/${encodeURIComponent(f.storedName)}" class="btn-download">⬇ Download</a>
+          <a href="${escapeHtml(f.download_url)}" target="_blank" rel="noopener noreferrer" class="btn-download">⬇ Download</a>
         </div>
       </div>`).join('');
 
@@ -370,8 +393,8 @@ function renderDashboard(data) {
   </div>
   <div class="endpoint-card">
     <span class="method get">GET</span>
-    <div class="endpoint-path">/download/:filename</div>
-    <div class="endpoint-desc">Download any uploaded file by its stored filename.</div>
+    <div class="endpoint-path">/api/data</div>
+    <div class="endpoint-desc">Fetch raw JSON data of all messages and files.</div>
   </div>
 </div>
 
@@ -596,7 +619,7 @@ function renderUploadPage() {
         resultBox.style.display = 'block';
         if (res.success) {
           resultBox.className = 'result success';
-          resultBox.innerHTML = '✅ <strong>' + res.data.originalName + '</strong> uploaded! <a href="' + res.data.downloadUrl + '">Download it</a> · <a href="/">View Dashboard →</a>';
+          resultBox.innerHTML = '✅ <strong>' + res.data.original_name + '</strong> uploaded! <a href="' + res.data.download_url + '" target="_blank">Download it</a> · <a href="/">View Dashboard →</a>';
           clearFile();
           noteInput.value = '';
         } else {
