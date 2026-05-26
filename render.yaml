@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: file-message-acceptor
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+    disk:
+      name: inbox-data
+      mountPath: /opt/render/project/src/uploads
+      sizeGB: 1
